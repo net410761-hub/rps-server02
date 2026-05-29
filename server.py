@@ -1,0 +1,161 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import psycopg2
+import psycopg2.extras
+import os
+import re
+from datetime import datetime
+
+app = Flask(__name__)
+CORS(app)
+
+# Переменные окружения
+DATABASE_URL = os.environ.get('DATABASE_URL')
+SECRET_KEY = os.environ.get('API_SECRET', 'rps_super_secret_2026')
+
+# Подключение к базе данных
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+# Создание таблиц при запуске
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS leaderboard (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(50) NOT NULL,
+            streak INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS wins (
+            id SERIAL PRIMARY KEY,
+            player_name VARCHAR(50) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS evolution_state (
+            id SERIAL PRIMARY KEY,
+            total_wins INTEGER DEFAULT 0,
+            target_wins INTEGER DEFAULT 10000,
+            current_generation INTEGER DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cur.execute('SELECT COUNT(*) FROM evolution_state')
+    if cur.fetchone()[0] == 0:
+        cur.execute('''
+            INSERT INTO evolution_state (total_wins, target_wins, current_generation)
+            VALUES (0, 10000, 1)
+        ''')
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def validate_name(name):
+    if not name or len(name) > 50:
+        return False
+    return bool(re.match(r'^[a-zA-Zа-яА-Я0-9_]{3,50}$', name))
+
+# Публичные эндпоинты (без ключа)
+@app.route('/api/leaderboard', methods=['GET'])
+def get_leaderboard():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute('SELECT name, streak FROM leaderboard ORDER BY streak DESC LIMIT 50')
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify([{'name': r['name'], 'streak': r['streak']} for r in rows])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/evolution', methods=['GET'])
+def get_evolution():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute('SELECT total_wins, target_wins, current_generation FROM evolution_state LIMIT 1')
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            return jsonify({
+                'total_wins': row['total_wins'],
+                'target_wins': row['target_wins'],
+                'current_generation': row['current_generation']
+            })
+        return jsonify({'error': 'No evolution state'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'alive'})
+
+# Защищённые эндпоинты (с ключом)
+@app.route('/api/record-win', methods=['POST'])
+def record_win():
+    api_key = request.headers.get('X-API-Key')
+    if api_key != SECRET_KEY:
+        return jsonify({'error': 'unauthorized'}), 401
+    
+    data = request.json
+    player_name = data.get('player_name', '')
+    
+    if not validate_name(player_name):
+        return jsonify({'error': 'Invalid name'}), 400
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('INSERT INTO wins (player_name) VALUES (%s)', (player_name,))
+        cur.execute('UPDATE evolution_state SET total_wins = total_wins + 1')
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/record-record', methods=['POST'])
+def record_record():
+    api_key = request.headers.get('X-API-Key')
+    if api_key != SECRET_KEY:
+        return jsonify({'error': 'unauthorized'}), 401
+    
+    data = request.json
+    name = data.get('name', '')
+    streak = data.get('streak', 0)
+    
+    if not validate_name(name) or not isinstance(streak, int) or streak <= 0:
+        return jsonify({'error': 'Invalid data'}), 400
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO leaderboard (name, streak, created_at) 
+            VALUES (%s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (name) DO UPDATE 
+            SET streak = EXCLUDED.streak, created_at = CURRENT_TIMESTAMP
+        ''', (name, streak))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
